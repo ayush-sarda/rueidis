@@ -7993,6 +7993,7 @@ func TestClusterClientConnLifetime(t *testing.T) {
 		}
 	})
 
+	
 	t.Run("DoMultiCache ConnLifetime - at the head of processing", func(t *testing.T) {
 		client, m := setup()
 		var attempts int64
