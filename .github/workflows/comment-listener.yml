@@ -1,0 +1,11 @@
+name: Comment listener
+on:
+  issue_comment:
+    types: [created]
+
+jobs:
+  print-comment:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Print comment
+        run: echo "Comment: ${{ github.event.comment.body }}"
