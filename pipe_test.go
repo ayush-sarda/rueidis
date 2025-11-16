@@ -546,6 +546,41 @@ func TestNewPipe(t *testing.T) {
 		n1.Close()
 		n2.Close()
 	})
+	t.Run("With EnableRedirect", func(t *testing.T) {
+		n1, n2 := net.Pipe()
+		mock := &redisMock{buf: bufio.NewReader(n2), conn: n2, t: t}
+		go func() {
+			mock.Expect("HELLO", "3").
+				Reply(slicemsg(
+					'%',
+					[]RedisMessage{
+						strmsg('+', "proto"),
+						{typ: ':', intlen: 3},
+					},
+				))
+			mock.Expect("CLIENT", "TRACKING", "ON", "OPTIN").
+				ReplyString("OK")
+			mock.Expect("CLIENT", "CAPA", "redirect").
+				ReplyString("OK")
+			mock.Expect("CLIENT", "SETINFO", "LIB-NAME", LibName).
+				ReplyString("OK")
+			mock.Expect("CLIENT", "SETINFO", "LIB-VER", LibVer).
+				ReplyString("OK")
+		}()
+		p, err := newPipe(context.Background(), func(ctx context.Context) (net.Conn, error) { return n1, nil }, &ClientOption{
+			Standalone: StandaloneOption{
+				EnableRedirect: true,
+			},
+		})
+		if err != nil {
+			t.Fatalf("pipe setup failed: %v", err)
+		}
+		go func() { mock.Expect("PING").ReplyString("OK") }()
+		p.Close()
+		mock.Close()
+		n1.Close()
+		n2.Close()
+	})
 }
 
 func TestNewRESP2Pipe(t *testing.T) {
@@ -849,6 +884,52 @@ func TestNewRESP2Pipe(t *testing.T) {
 		if err != io.ErrClosedPipe {
 			t.Fatalf("pipe setup should failed with io.ErrClosedPipe, but got %v", err)
 		}
+	})
+	t.Run("With EnableRedirect RESP2", func(t *testing.T) {
+		n1, n2 := net.Pipe()
+		mock := &redisMock{buf: bufio.NewReader(n2), conn: n2, t: t}
+		go func() {
+			// First batch: RESP3 attempt
+			mock.Expect("HELLO", "3").
+				ReplyError("ERR unknown command `HELLO`")
+			mock.Expect("CLIENT", "NO-EVICT", "ON").
+				ReplyString("OK") // ignored because r2=true
+			mock.Expect("CLIENT", "CAPA", "redirect").
+				ReplyString("OK") // ignored because r2=true
+			mock.Expect("CLIENT", "SETINFO", "LIB-NAME", LibName).
+				ReplyString("OK") // last 2 are skipped from error checking
+			mock.Expect("CLIENT", "SETINFO", "LIB-VER", LibVer).
+				ReplyString("OK")
+			// Second batch: RESP2 fallback
+			mock.Expect("HELLO", "2").
+				Reply(slicemsg('*', []RedisMessage{
+					strmsg('+', "proto"),
+					{typ: ':', intlen: 2},
+				}))
+			mock.Expect("CLIENT", "NO-EVICT", "ON").
+				ReplyString("OK")
+			mock.Expect("CLIENT", "CAPA", "redirect").
+				ReplyString("OK")
+			mock.Expect("CLIENT", "SETINFO", "LIB-NAME", LibName).
+				ReplyString("OK")
+			mock.Expect("CLIENT", "SETINFO", "LIB-VER", LibVer).
+				ReplyString("OK")
+		}()
+		p, err := newPipe(context.Background(), func(ctx context.Context) (net.Conn, error) { return n1, nil }, &ClientOption{
+			DisableCache:  true,
+			ClientNoEvict: true,
+			Standalone: StandaloneOption{
+				EnableRedirect: true,
+			},
+		})
+		if err != nil {
+			t.Fatalf("pipe setup failed: %v", err)
+		}
+		go func() { mock.Expect("PING").ReplyString("OK") }()
+		p.Close()
+		mock.Close()
+		n1.Close()
+		n2.Close()
 	})
 	t.Run("With DisableClientSetInfo", func(t *testing.T) {
 		n1, n2 := net.Pipe()
@@ -3501,7 +3582,7 @@ func TestPubSub(t *testing.T) {
 
 			p, mock, _, _ := setup(t, ClientOption{})
 			atomic.StoreInt32(&p.state, 1)
-			p.queue.PutOne(push)
+			p.queue.PutOne(context.Background(), push)
 			_, _, ch := p.queue.NextWriteCmd()
 			go func() {
 				mock.Expect().Reply(strmsg(
@@ -3531,8 +3612,8 @@ func TestPubSub(t *testing.T) {
 
 			p, mock, _, _ := setup(t, ClientOption{})
 			atomic.StoreInt32(&p.state, 1)
-			p.queue.PutOne(push)
-			p.queue.PutOne(cmds.PingCmd)
+			p.queue.PutOne(context.Background(), push)
+			p.queue.PutOne(context.Background(), cmds.PingCmd)
 			_, _, ch := p.queue.NextWriteCmd()
 			_, _, _ = p.queue.NextWriteCmd()
 			go func() {
@@ -3824,7 +3905,7 @@ func TestPubSub(t *testing.T) {
 
 			p, mock, _, _ := setup(t, ClientOption{})
 			atomic.StoreInt32(&p.state, 1)
-			p.queue.PutOne(builder.Get().Key("a").Build())
+			p.queue.PutOne(context.Background(), builder.Get().Key("a").Build())
 			p.queue.NextWriteCmd()
 			go func() {
 				mock.Expect().Reply(slicemsg(
@@ -3854,7 +3935,7 @@ func TestPubSub(t *testing.T) {
 
 			p, mock, _, _ := setup(t, ClientOption{})
 			atomic.StoreInt32(&p.state, 1)
-			p.queue.PutOne(cmd)
+			p.queue.PutOne(context.Background(), cmd)
 			p.queue.NextWriteCmd()
 			go func() {
 				mock.Expect().Reply(strmsg('+', "QUEUED"))
@@ -4258,6 +4339,67 @@ func TestExitOnRingFullAndPingTimeout(t *testing.T) {
 	}
 	// let writer loop over the ring
 	for i := 0; i < len(p.queue.(*ring).store); i++ {
+		mock.Expect("GET", "a")
+	}
+
+	if err := p.Do(context.Background(), cmds.NewCompleted([]string{"GET", "a"})).Error(); !errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Errorf("unexpected result, expected context.DeadlineExceeded, got %v", err)
+	}
+}
+
+func TestExitOnFlowBufferFullAndConnError(t *testing.T) {
+	defer ShouldNotLeak(SetupLeakDetection())
+	queueTypeFromEnv = "flowbuffer"
+	defer func() { queueTypeFromEnv = "" }()
+
+	p, mock, _, closeConn := setup(t, ClientOption{
+		RingScaleEachConn: 1,
+	})
+	p.background()
+
+	// fill the buffer
+	for i := 0; i < 2; i++ {
+		go func() {
+			if err := p.Do(context.Background(), cmds.NewCompleted([]string{"GET", "a"})).Error(); err != io.EOF && !strings.HasPrefix(err.Error(), "io:") {
+				t.Errorf("unexpected result, expected io err, got %v", err)
+			}
+		}()
+	}
+	// let writer loop over the buffer
+	for i := 0; i < 2; i++ {
+		mock.Expect("GET", "a")
+	}
+
+	time.Sleep(time.Second) // make sure the writer is waiting for the next write
+	closeConn()
+
+	if err := p.Do(context.Background(), cmds.NewCompleted([]string{"GET", "a"})).Error(); err != io.EOF && !strings.HasPrefix(err.Error(), "io:") {
+		t.Errorf("unexpected result, expected io err, got %v", err)
+	}
+}
+
+func TestExitOnFlowBufferFullAndPingTimeout(t *testing.T) {
+	defer ShouldNotLeak(SetupLeakDetection())
+	queueTypeFromEnv = "flowbuffer"
+	defer func() { queueTypeFromEnv = "" }()
+
+	p, mock, _, _ := setup(t, ClientOption{
+		RingScaleEachConn: 1,
+		ConnWriteTimeout:  500 * time.Millisecond,
+		Dialer:            net.Dialer{KeepAlive: 500 * time.Millisecond},
+	})
+	p.background()
+
+	// fill the buffer
+	for i := 0; i < 2; i++ {
+		go func() {
+			if err := p.Do(context.Background(), cmds.NewCompleted([]string{"GET", "a"})).Error(); !errors.Is(err, os.ErrDeadlineExceeded) {
+				t.Errorf("unexpected result, expected context.DeadlineExceeded, got %v", err)
+			}
+		}()
+	}
+	// let writer loop over the buffer
+	for i := 0; i < 2; i++ {
 		mock.Expect("GET", "a")
 	}
 
